@@ -20,14 +20,14 @@
  * changes the clock rate nor changes the smallest interval between edges there
  * seems little reason not to always use it.
  */
-#define USE_HIGH_SPEED          1
+#define USE_HIGH_SPEED          0
 
 /* Only write differences to the target.
  * If set to 1 then a write operation first reads the relevant memory from the
  * target then only writes back those blocks that contain actual changes thus
  * sparing flash from unnecessary erase-and-rewrite cycles.
  */
-#define ONLY_WRITE_DIFFS        1
+#define ONLY_WRITE_DIFFS        0
 
 
 #define MAX_SWIM_ERRORS         8
@@ -348,7 +348,12 @@ bool stlink2_open(programmer_t *pgm) {
 		case STLINK_MODE_DEBUG:
 			stlink2_cmd(pgm, 2, STLINK_DEBUG, DEBUG_EXIT);
 			break;
-
+/*
+		case STLINK_MODE_SWIM:
+			stlink2_cmd(pgm, 2, STLINK_SWIM, SWIM_EXIT);
+			stlink2_cmd(pgm, 2, STLINK_SWIM, SWIM_ENTER);
+			break;
+*/	
 		case STLINK_MODE_BOOTLOADER:
 		case STLINK_MODE_DFU:
 		case STLINK_MODE_MASS:
@@ -377,9 +382,10 @@ bool stlink2_open(programmer_t *pgm) {
 	// Mask internal interrupt sources, enable access to whole of memory,
 	// prioritize SWIM and stall the CPU.
 	swim_write_byte(pgm, 0xa1, 0x7f80);
+	swim_write_byte(pgm,0x9,0x7F99); // stall CPU & flush
 
 	swim_cmd(pgm, 2, STLINK_SWIM, SWIM_DEASSERT_RESET);
-	usleep(1000);
+	usleep(10000);
 
 #if USE_HIGH_SPEED
 	stlink2_high_speed(pgm);
@@ -397,6 +403,9 @@ void stlink2_srst(programmer_t *pgm) {
 
 void stlink2_close(programmer_t *pgm) {
 	stlink2_cmd(pgm, 2, STLINK_SWIM, SWIM_EXIT);
+	// bit strange that usb_init is done in main, and exit done here..
+	libusb_close(pgm->dev_handle);
+	libusb_exit(pgm->ctx); //close the session
 }
 
 static void swim_write_byte(programmer_t *pgm, unsigned char byte, unsigned int start) {
@@ -560,4 +569,177 @@ int stlink2_swim_write_range(programmer_t *pgm, const stm8_device_t *device, uns
 	}
 
 	return(length);
+}
+
+// test voor uitlezen flash bij ROP
+
+uint8_t flashDownload[] = {
+  // ramBlock           @ 0x01 (256 bytes)
+  // triggerBlockCopy   @ 0x101 (1byte)
+  // flashStartAddress  @ 0x102 (4bytes)
+
+  // src/mymain.c: 21: flashStartAddress = FLASH_START;
+  0xAE, 0x80, 0x00, //        [ 2]   99 	ldw	x, #0x8000
+  0xCF, 0x01, 0x04, //        [ 2]  100 	ldw	_flashStartAddress+2, x
+  0x5F,             //        [ 1]  101 	clrw	x
+  0xCF, 0x01, 0x02, //        [ 2]  102 	ldw	_flashStartAddress+0, x
+  // src/mymain.c: 22: triggerBlockCopy = true;
+  //TEST 0x35, 0x01, 0x01, 0x01, //      [ 1]  105 	mov	_triggerBlockCopy+0, #0x01
+  // src/mymain.c: 24: while (flashStartAddress < FLASH_END) {
+  // 00104$:
+  0xCE, 0x01, 0x04, //         [ 2]  111 	ldw	x, _flashStartAddress+2
+  0xA3, 0xA0, 0x00, //         [ 2]  112 	cpw	x, #0xa000
+  0xC6, 0x01,0x03,  //        [ 1]  113 	ld	a, _flashStartAddress+1
+  0xA2, 0x00,       //           [ 1]  114 	sbc	a, #0x00
+  0xC6, 0x01,0x02,  //         [ 1]  115 	ld	a, _flashStartAddress+0
+  0xA2, 0x00,       //            [ 1]  116 	sbc	a, #0x00
+  0x25, 0x03,       //            [ 1]  117 	jrc	00138$
+  // 0xCC, 0x81, 0x8A, //         [ 2]  118 	jp	00110$ TODO AANPASSEN NAAR RAM ADDRESS
+  // jump absolute vervangen door relative
+  0x20, 0x42, 0x9D, // JRA 0x42, NOP ; sds
+
+  // 00138$:
+  // src/mymain.c: 25: if (triggerBlockCopy) {
+  0x72, 0x00, 0x01, 0x01, 0x02, //   [ 2]  123 	btjt	_triggerBlockCopy+0, #0, 00139$
+  0x20, 0xE4,       //            [ 2]  124 	jra	00104$
+  // 00139$:
+  // src/mymain.c: 26: for (uint16_t i=0;i<RAM_BLOCK_SIZE;i++) {
+  0x5F, //               [ 1]  129 	clrw	x
+  0x1F, 0x01, //         [ 2]  130 	ldw	(0x01, sp), x
+  // 00108$:
+  0x1E, 0x01, //            [ 2]  133 	ldw	x, (0x01, sp)
+  0xA3, 0x01, 0x00, //         [ 2]  134 	cpw	x, #0x0100
+  0x24, 0x14, //            [ 1]  135 	jrnc	00101$
+  // src/mymain.c: 28: flashAddress = (uint8_t*) (flashStartAddress + i);
+  0xCE, 0x01, 0x04, //         [ 2]  139 	ldw	x, _flashStartAddress+2
+  0x72, 0xFB, 0x01, //         [ 2]  140 	addw	x, (0x01, sp)
+  // src/mymain.c: 29: ramBlock[i] = *flashAddress;
+  0x16, 0x01, //            [ 2]  143 	ldw	y, (0x01, sp)
+  0xF6, //               [ 1]  144 	ld	a, (x)
+  0x90, 0xD7, 0x00, 0x01, //    [ 1]  145 	ld	((_ramBlock + 0), y), a
+  // src/mymain.c: 26: for (uint16_t i=0;i<RAM_BLOCK_SIZE;i++) {
+  0x1E, 0x01, //            [ 2]  148 	ldw	x, (0x01, sp)
+  0x5C, //               [ 1]  149 	incw	x
+  0x1F, 0x01, //            [ 2]  150 	ldw	(0x01, sp), x
+  0x20, 0xE5, //            [ 2]  151 	jra	00108$
+  // 00101$:
+  // src/mymain.c: 31: triggerBlockCopy = false;
+  0x72, 0x5F, 0x01, 0x01, //      [ 1]  156 	clr	_triggerBlockCopy+0
+  // src/mymain.c: 32: flashStartAddress += RAM_BLOCK_SIZE;
+  0xCE, 0x01, 0x04, //         [ 2]  159 	ldw	x, _flashStartAddress+2
+  0x1C, 0x01, 0x00, //         [ 2]  160 	addw	x, #0x0100
+  0x90, 0xCE, 0x01, 0x02, //      [ 2]  161 	ldw	y, _flashStartAddress+0
+  0x24, 0x02, //            [ 1]  162 	jrnc	00142$
+  0x90, 0x5C, //            [ 1]  163 	incw	y
+  // 00142$:
+  0xCF, 0x01, 0x04, //         [ 2]  165 	ldw	_flashStartAddress+2, x
+  0x90, 0xCF, 0x01, 0x02, //      [ 2]  166 	ldw	_flashStartAddress+0, y
+  // 0xCC, 0x81, 0x34 //         [ 2]  168 	jp	00104$ TODO AANPASSEN NAAR RAM
+  // jr -56h
+  0x20, 0xAA,
+	//sds reset -> raar maar da werkt nie. pc goes wild
+	0xCC, 0x80, 0x80
+};
+
+void printBlock(uint8_t *buf, uint32_t size, char *name) {
+	printf("%s = ",name);
+	for (uint32_t i=0;i<size;i++){
+		printf("%x ",buf[i]);
+		if (i%10 == 9) printf("\n");
+	}
+	printf("\n");
+}
+
+int stlink2_download(programmer_t *pgm, const stm8_device_t *device, unsigned char *buf, unsigned int start, unsigned int size) {
+  // write flashDownload to ram @ 0x140
+  // set PC @ 0x140
+  // run for a while
+  // readout ramblock @ 0x1 (256 bytes)
+  // set @ 0x101 = 1 (triggercopy = true) to continue next block
+  // repeat until done
+  uint32_t cntBytes = 0;
+	int flag;
+	uint8_t ramBlock[256];
+	uint8_t pc[3];
+	uint8_t addr[4];
+
+
+	//test eerst target efkes laten lopen; probleem code execution na reset??
+  printf("run for 2 seconds\n");
+	swim_write_byte(pgm,0x1,0x7F99); // flush & restart cpu
+	usleep(2000000);
+  printf("stalling cpu now\n");
+	swim_write_byte(pgm,0x9,0x7F99); // stall CPU & flush (was normaal al gebeurd bij open())
+
+  printf("starting download\n");
+	for (uint16_t i=0;i<256;i++)
+		ramBlock[i] = 0;
+
+  printf("write ramcode, size %ld\n", sizeof(flashDownload));
+
+	// copy flashdownload code to ram
+	swim_write_byte(pgm,0x9,0x7F99); // stall CPU & flush (was normaal al gebeurd bij open())
+	swim_cmd_with_data(pgm, flashDownload,sizeof(flashDownload), 8, STLINK_SWIM, SWIM_WRITEMEM, 
+					HI(sizeof(flashDownload)), LO(sizeof(flashDownload)),
+					0x00, 0x00, 0x01, 0x40);
+
+	// for test, set ramblock to 0
+	swim_cmd_with_data(pgm, ramBlock,sizeof(ramBlock), 8, STLINK_SWIM, SWIM_WRITEMEM, 
+					HI(sizeof(ramBlock)), LO(sizeof(ramBlock)),
+					0x00, 0x00, 0x00, 0x01);
+
+	usleep(1000);
+
+	// set PC
+	swim_write_byte(pgm, 0x0, 0x7F01); // PCE
+	swim_write_byte(pgm, 0x01, 0x7F02); // PCH
+	swim_write_byte(pgm, 0x40, 0x7F03); // PCL
+
+	swim_write_byte(pgm,0x9,0x7F99); // flush & restart cpu
+
+	// check ram code for test
+	stlink2_swim_read_range(pgm, device, ramBlock, 0x140, sizeof(flashDownload));
+	printBlock(ramBlock,sizeof(flashDownload),"ram code");
+
+	// for test check PC
+	stlink2_swim_read_range(pgm, device, pc, 0x7F01, 3);
+	printBlock(pc,3, "pc tic");
+	stlink2_swim_read_range(pgm, device, addr, 0x102, 4);
+	printBlock(addr,4,"startaddress");
+
+	swim_write_byte(pgm,0x1,0x7F99); // flush & restart cpu
+
+
+	while (cntBytes < size) {
+		printf("reading bytes at 0x%x",0x8000+cntBytes);
+
+		// for test check PC
+		//stlink2_swim_read_range(pgm, device, pc, 0x7F01, 3);
+		//printBlock(pc,3, "pc tic");
+
+		// for test check flashStartAddress
+		// waarom krijgen we hier soms vreemde waarden ???
+		stlink2_swim_read_range(pgm, device, addr, 0x102, 4);
+		printBlock(addr,4,"startaddress");
+
+		swim_write_byte(pgm, 0x1, 0x101); // triggercopyflag, triggers the ram code to copy the next block
+		//swim_write_byte(pgm,0x1,0x7F99); // flush & restart cpu
+
+		do {
+			printf(".");
+			usleep (10); // wait for code to execute
+			flag = swim_read_byte(pgm, 0x101);
+		}
+		while (flag != 0);
+			printf("\n");
+		// code has copied 256 bytes from flash
+		// read from the ram buffer @ 0x1
+		stlink2_swim_read_range(pgm, device, ramBlock, 0x1, 256);
+		printBlock(ramBlock,256, "ramblock");
+		stlink2_swim_read_range(pgm, device, buf+cntBytes, 0x1, 256);
+		cntBytes += 256;
+	}
+  printf("finished download\n");
+
+	return cntBytes;
 }

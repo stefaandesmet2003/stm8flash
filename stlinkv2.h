@@ -5,7 +5,12 @@
 
 bool stlink2_open(programmer_t *pgm);
 void stlink2_srst(programmer_t *pgm);
+void stlink2_close(programmer_t *pgm);
 int stlink2_swim_read_range(programmer_t *pgm, const stm8_device_t *device, unsigned char *buffer, unsigned int start, unsigned int length);
 int stlink2_swim_write_range(programmer_t *pgm, const stm8_device_t *device, unsigned char *buffer, unsigned int start, unsigned int length, const memtype_t memtype);
+
+
+int stlink2_download(programmer_t *pgm, const stm8_device_t *device, unsigned char *buffer, unsigned int start, unsigned int length);
+
 
 #endif

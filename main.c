@@ -19,6 +19,8 @@
 #include "ihex.h"
 #include "srec.h"
 
+#include "autodetect.h"
+
 typedef enum {
     INTEL_HEX = 0,
     MOTOROLA_S_RECORD,
@@ -38,7 +40,8 @@ extern int optreset;
 #define VERSION_NOTES ""
 
 programmer_t pgms[] = {
-	{ 	"stlink",
+	{
+		"stlink",
 		STLinkV1,
 		0x0483, // USB vid
 		0x3744, // USB pid
@@ -54,7 +57,7 @@ programmer_t pgms[] = {
 		0x0483,
 		0x3748,
 		stlink2_open,
-		stlink_close,
+		stlink2_close,
 		stlink2_srst,
 		stlink2_swim_read_range,
 		stlink2_swim_write_range,
@@ -65,7 +68,7 @@ programmer_t pgms[] = {
 		0x0483,
 		0x374b,
 		stlink2_open,
-		stlink_close,
+		stlink2_close,
 		stlink2_srst,
 		stlink2_swim_read_range,
 		stlink2_swim_write_range,
@@ -76,7 +79,7 @@ programmer_t pgms[] = {
 		0x0483,
 		0x374f,
 		stlink2_open,
-		stlink_close,
+		stlink2_close,
 		stlink2_srst,
 		stlink2_swim_read_range,
 		stlink2_swim_write_range,
@@ -206,7 +209,6 @@ bool usb_init(programmer_t *pgm, bool pgm_serialno_specified, char *pgm_serialno
 	}
 
 	if(numOfProgrammers > 1 || pgm_serialno_specified){
-
 		// no serialno given
 		if(!pgm_serialno_specified) {
 			fprintf(stderr, "WARNING: More than one programmer found but no serial number given. Programmer 1 will be used:\n");
@@ -256,9 +258,6 @@ bool usb_init(programmer_t *pgm, bool pgm_serialno_specified, char *pgm_serialno
 		pgm->dev_handle = libusb_open_device_with_vid_pid(ctx, pgm->usb_vid, pgm->usb_pid);
 	}
 
-
-
-
 	pgm->ctx = ctx;
 	if (!pgm->dev_handle) spawn_error("Could not open USB device.");
 	// assert(pgm->dev_handle);
@@ -304,14 +303,19 @@ int main(int argc, char **argv) {
 		pgm_specified = false,
 		pgm_serialno_specified = false,
 		part_specified = false,
-        bytes_count_specified = false;
+		bytes_count_specified = false,
+		part_auto_detection = false; 
 	memtype_t memtype = FLASH;
 	const char * port = NULL;
 	int i;
 	programmer_t *pgm = NULL;
 	const stm8_device_t *part = NULL;
-	while((c = getopt (argc, argv, "r:w:v:nc:S:p:d:s:b:luV")) != (char)-1) {
+	stm8_device_t autodetect_part;
+	while((c = getopt (argc, argv, "r:w:x:v:nc:S:p:d:s:b:aluV")) != (char)-1) {
 		switch(c) {
+			case 'a' :
+				part_auto_detection = true;
+				break;
 			case 'c':
 				pgm_specified = true;
 				for(i = 0; pgms[i].name; i++) {
@@ -348,21 +352,27 @@ int main(int argc, char **argv) {
 				action = VERIFY;
 				strcpy(filename, optarg);
 				break;
-                        case 'u':
+			case 'u':
 				action = UNLOCK;
 				start  = 0x4800;
 				memtype = OPT;
 				strcpy(filename, "Workaround");
 				break;
+			case 'x':
+				action = CRACK;
+				start = 0x8000;
+				memtype = FLASH;
+				strcpy(filename, optarg);
+				break;
 			case 's':
-                // Start addr is depending on MCU type
+				// Start addr is depending on MCU type
 				if(strcasecmp(optarg, "flash") == 0) {
 					memtype = FLASH;
-                } else if(strcasecmp(optarg, "eeprom") == 0) {
+				} else if(strcasecmp(optarg, "eeprom") == 0) {
 					memtype = EEPROM;
-                } else if(strcasecmp(optarg, "ram") == 0) {
+				} else if(strcasecmp(optarg, "ram") == 0) {
 					memtype = RAM;
-                } else if(strcasecmp(optarg, "opt") == 0) {
+				} else if(strcasecmp(optarg, "opt") == 0) {
 					memtype = OPT;
 				} else {
 					// Start addr is specified explicitely
@@ -374,13 +384,13 @@ int main(int argc, char **argv) {
 				break;
 			case 'b':
 				bytes_count = atoi(optarg);
-                bytes_count_specified = true;
+				bytes_count_specified = true;
 				break;
 			case 'V':
-                                print_version_and_exit( (bool)0);
+				print_version_and_exit( (bool)0);
 				break;
 			case '?':
-                                print_help_and_exit(argv[0], false);
+				print_help_and_exit(argv[0], false);
 			default:
 				print_help_and_exit(argv[0], true);
 		}
@@ -395,6 +405,36 @@ int main(int argc, char **argv) {
 	if(!pgm)
 		spawn_error("No programmer has been specified");
 	pgm->port = port;
+
+
+	// part auto-detection
+	if (part_auto_detection) {
+		int retval;
+
+		// start connection to programmer
+		if(!usb_init(pgm, pgm_serialno_specified, pgm_serialno))
+			spawn_error("Couldn't initialize programmer");
+
+		if(!pgm->open(pgm))
+			spawn_error("Error communicating with MCU. Please check your SWIM connection.");
+
+		retval = autodetect(pgm, &autodetect_part);
+		pgm->reset(pgm);
+		pgm->close(pgm);
+		//usleep(1000000);
+		
+		if (retval) {
+			fprintf(stderr, "auto-detection failed with code %d\n",retval);
+		}
+		else {
+			part_specified = true;
+			part = &autodetect_part;
+			fprintf(stderr, "auto-detection successful\n");
+		}
+		// exit here for test; but it should work to continue now
+		// exit(0);
+	}
+
 	if(part_specified && !part) {
 		fprintf(stderr, "No valid part specified. Use -l to see the list of supported devices.\n");
 		exit(-1);
@@ -472,8 +512,9 @@ int main(int argc, char **argv) {
 		spawn_error("No filename has been specified");
 	if(!action || !start_addr_specified || !strlen(filename))
 		print_help_and_exit(argv[0], true);
+
 	if(!usb_init(pgm, pgm_serialno_specified, pgm_serialno))
-		spawn_error("Couldn't initialize stlink");
+		spawn_error("Couldn't initialize programmer");
 	if(!pgm->open(pgm))
 		spawn_error("Error communicating with MCU. Please check your SWIM connection.");
 
@@ -631,6 +672,41 @@ int main(int argc, char **argv) {
 		}
 		fprintf(stderr, "Unlocked device. Option bytes reset to default state.\n");
 		fprintf(stderr, "Bytes written: %d\n", sent);
+	} else if (action == CRACK) {
+		// file openen om bytes te lezen
+		fprintf(stderr, "Cracking %d bytes at 0x%x... ", bytes_count, start);
+		fflush(stderr);
+		int bytes_count_align = ((bytes_count-1)/256+1)*256; // Reading should be done in blocks of 256 bytes
+		unsigned char *buf = malloc(bytes_count_align);
+		if(!buf) spawn_error("malloc failed");
+		int recv = stlink2_download(pgm, part, buf, start, bytes_count_align);
+		if(recv < bytes_count_align) {
+			fprintf(stderr, "\r\nRequested %d bytes but received only %d.\r\n", bytes_count_align, recv);
+			spawn_error("Failed to read MCU");
+		}
+		if(!(f = fopen(filename, (fileformat == RAW_BINARY) ? "wb" : "w")))
+			spawn_error("Failed to open file");
+		switch(fileformat)
+		{
+		case INTEL_HEX:
+			if(ihex_write(f, buf, start, start+bytes_count) < 0)
+			  exit(-1);
+			break;
+		case MOTOROLA_S_RECORD:
+			srec_write(f, buf, start, start+bytes_count);
+			break;
+		default:
+			fwrite(buf, 1, bytes_count, f);
+		}
+		fclose(f);
+		fprintf(stderr, "OK\n");
+		fprintf(stderr, "Bytes received: %d\n", bytes_count);
+		/*
+		if(pgm->reset) {
+			// Restarting core (if applicable)
+			pgm->reset(pgm);
+		}
+		*/
 	}
 	return(0);
 }
